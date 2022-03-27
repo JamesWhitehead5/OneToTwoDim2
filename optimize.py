@@ -1,15 +1,12 @@
 import json
 import pickle
-import sys
 import time
-
 import numpy as np
 import torch
-import pylab as plt
-from scipy.io import loadmat
-from tqdm import tqdm
+from torchviz import make_dot
+import graphviz
 
-from AngularPropTorch.angular_propagate_pytorch import PropagatePadded
+
 from tools import OpticalLayer
 
 
@@ -74,14 +71,6 @@ def loss_fn(output, target):
     return torch.sum(torch.abs(output - target))
     # return torch.sum(torch.abs(output - target)) / torch.sum(output)
 
-
-def set_learning_rate(optimizer, lr):
-    def set_opt_param(optimizer, key, value):
-        for group in optimizer.param_groups:
-            group[key] = value
-
-    print('[i] set learning rate to {}'.format(lr))
-    set_opt_param(optimizer, 'lr', lr)
 #
 # def setup_propagators(sim_args):
 #     prop1 = PropagatePadded(
@@ -132,7 +121,8 @@ def set_learning_rate(optimizer, lr):
 
 
 if __name__ == '__main__':
-    device = torch.device('cuda')
+    # device = torch.device('cuda')
+    device = None
 
     sim_args = {
         'wavelength': 1550e-9,  # simulation wavelength in meters
@@ -149,7 +139,6 @@ if __name__ == '__main__':
         'n_modes': 49,
     }
 
-
     # number simulation grid pixels that represent a single output grid square
     sim_args['grid_elements_per_output'] = int(sim_args['grid_n'] / sim_args['n_modes'])
     sim_args['output_spacing'] = sim_args['grid_elements_per_output'] / sim_args['grid_n'] * sim_args['grid_size']
@@ -160,7 +149,7 @@ if __name__ == '__main__':
     sim_args['dd'] = sim_args['grid_size'] / sim_args['grid_n']  # array element spacing
 
     source_args = {
-        'n_weights': sim_args['n_modes'],
+        'n_modes': sim_args['n_modes'],
         'pixel_width': 2,
         'pixel_height': 2,
         'pixel_spacing': 5,
@@ -181,60 +170,64 @@ if __name__ == '__main__':
 
     best_loss = float('Inf')
 
-    optical_layer = OpticalLayer(sim_args, source_args).to(device)
+    # optical_layer = OpticalLayer(sim_args, source_args).to(device)
+    optical_layer = OpticalLayer(sim_args, source_args)
+
+    # save graph
+    dot = make_dot(loss_fn(optical_layer(weights), weights), params=dict(optical_layer.named_parameters()))
+    dot.render(directory='graph-output')
 
     loss_log = []  # log of loss values recorded throughout optimization
-    lr = 1e-1  # initial learning rate
-    optimizer = torch.optim.Adam(optical_layer.parameters(), lr=lr)
+    learning_rates = [1., 1e-1, 1e-2, 1e-3]  # initial learning rate
+    optimizer = torch.optim.Adam(optical_layer.parameters())
 
-    iterations = int(5e2)  # number of iterations for optimization
-    n_update = int(1e1)  # Prints information every `n_update` iterations
+    # iterations = int(5e2)  # number of iterations for optimization
+    iterations = int(100)
+    n_update = int(1)  # Prints information every `n_update` iterations
 
-    torch.backends.cudnn.benchmark = True
+    # torch.backends.cudnn.benchmark = True
 
     # Training loop
     t = time.time()
-    for i in range(iterations):
-        if i == int(iterations // 2):
-            set_learning_rate(optimizer, lr / 2)
-        if i == int(iterations / 10 * 8):
-            set_learning_rate(optimizer, lr / 10)
+    for learning_rate in learning_rates:
+        for group in optimizer.param_groups:
+            group['lr'] = learning_rate
+        print(f"Learning rate set to {learning_rate}")
 
-        optimizer.zero_grad()
-        # A: clean last-step gradient to ensure optimizer only uses gradient from current iteration to update params
+        for i in range(iterations):
+            optimizer.zero_grad()
 
-        activation = optical_layer(weights)
-        loss = loss_fn(activation, weights)
+            activation = optical_layer(weights)
+            loss = loss_fn(activation, weights)
 
-        # record the best optimized values
-        if loss.item() < best_loss:
-            best_loss = loss.item()
-            best_parameters = [parameter.detach().clone() for parameter in optical_layer.parameters()]
-            best_psf = activation.detach().clone()
+            # record the best optimized values
+            if loss.item() < best_loss:
+                with torch.no_grad():
+                    best_loss = loss.item()
+                    best_parameters = [parameter.detach().clone() for parameter in optical_layer.parameters()]
+                    best_psf = activation.detach().clone()
 
-        loss.backward()
-        optimizer.step()
+            loss.backward()
+            optimizer.step()
 
-        loss_log.append(loss.item())
-        if i % n_update == 0:
-            t_now = time.time()
-            print("Error: {}\tTimePerUpdate(s): {}\t {}/{}".format(loss, t_now - t, i + 1, iterations))
-            t = t_now
+            loss_log.append(loss.item())
+            if i % n_update == 0:
+                t_now = time.time()
+                print("Best loss: {}\tTimePerUpdate(s): {}\t {}/{}".format(best_loss, t_now - t, i + 1, iterations))
+                t = t_now
 
-        # plt.figure()
-        # plt.plot(loss_log)
-        # plt.show()
-        print(f'Best Error: {best_loss}')
+            print(f'Best Error: {best_loss}')
 
-    filename = json.load(open('global_args.json'))['data_file_name']
-    # save phase_profile and parameters
-    pickle.dump(
-        {
-            "phase_profile1": phase_profile1,
-            "phase_profile2": phase_profile2,
-            "sim_args": sim_args,
-            "source_args": source_args,
-        },
-        file=open(filename, "wb"),
-    )
+    with torch.no_grad():
+        filename = json.load(open('global_args.json'))['data_file_name']
+        # save phase_profile and parameters
+        pickle.dump(
+            {
+                "phase_profile1": optical_layer.phase_profile1.detach().numpy(),
+                "phase_profile2": optical_layer.phase_profile2.detach().numpy(),
+                "sim_args": sim_args,
+                "source_args": source_args,
+            },
+            file=open(filename, "wb"),
+        )
 
